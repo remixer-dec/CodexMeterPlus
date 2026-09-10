@@ -1,6 +1,9 @@
 # CodexMeterPlus
 
-A tiny macOS menu bar app for checking Codex usage across multiple accounts.
+A tiny macOS menu bar app for checking Codex usage across multiple accounts. Minimalistic and free from bloat by design.
+  
+<img width="364" height="411" alt="изображение" src="https://github.com/user-attachments/assets/3815af8b-3a24-4eca-9334-d4c3f9edf71b" />
+
 
 It shows the remaining quota for each account, reset times, and a compact menu bar view with the daily usage bar and reset ETA. 
 Weekly usage stays inside the popover to keep the menu bar clean. Updates every minute when open and every 5 minutes when closed.
@@ -128,4 +131,5 @@ The goal is simple: show the useful numbers, stay out of the way, and use almost
 
 ## License
 
-This repo is distributed under MIT License.
+This repo is distributed under MIT License. Feel free to add any features in your fork. 
+I am not planning to add Claude stats and model-based metrics available under higher subscription plans unless I will use them.
