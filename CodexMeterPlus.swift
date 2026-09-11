@@ -675,7 +675,10 @@ private final class PanelController: NSViewController {
         view = NSView(frame: NSRect(x: 0, y: 0, width: 344, height: 180))
 
         scroll.drawsBackground = false
-        scroll.hasVerticalScroller = true
+        // Enable the scroller only when the account content is capped below its
+        // requested height. `autohidesScrollers` alone can still reserve/show a
+        // scroller for a document view that exactly fills its clip view.
+        scroll.hasVerticalScroller = false
         scroll.autohidesScrollers = true
         scroll.borderType = .noBorder
 
@@ -775,11 +778,13 @@ private final class PanelController: NSViewController {
         if accounts.isEmpty {
             wanted = 60
         } else {
-            // A card is ~145 pt tall. Account for inter-card stack spacing so two
-            // complete accounts fit without forcing the scroll view to clip.
-            wanted = CGFloat(accounts.count) * 145 + CGFloat(max(0, accounts.count - 1)) * 9
+            // Leave a little breathing room below each account card so its final
+            // row never feels clipped against the next account or the actions.
+            wanted = CGFloat(accounts.count) * 152 + CGFloat(max(0, accounts.count - 1)) * 9
         }
-        scrollHeight.constant = min(620, wanted)
+        let maximumScrollHeight: CGFloat = 660
+        scroll.hasVerticalScroller = wanted > maximumScrollHeight
+        scrollHeight.constant = min(maximumScrollHeight, wanted)
         preferredContentSize = NSSize(width: 344, height: scrollHeight.constant + 54)
     }
 
@@ -1029,7 +1034,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
 
     private func updateStatusItem() {
         let items = store.accounts.map { account in
-            snapshots[account.file]?.fiveHour
+            let snapshot = snapshots[account.file]
+            return MiniBarUsage(hourly: snapshot?.fiveHour, weekly: snapshot?.weekly)
         }
         let image = statusImage(items: items, color: paletteColor(settings.data.barColor))
         statusItem.button?.image = image
@@ -1079,7 +1085,17 @@ private func statusETA(_ seconds: TimeInterval) -> String {
     return "\(max(0, Int(ceil(seconds / 60))))m"
 }
 
-private func statusImage(items: [UsageWindow?], color: NSColor) -> NSImage {
+private struct MiniBarUsage {
+    let hourly: UsageWindow?
+    let weekly: UsageWindow?
+
+    var weeklyIsExhausted: Bool {
+        guard let weekly else { return false }
+        return weekly.remaining <= 0
+    }
+}
+
+private func statusImage(items: [MiniBarUsage], color: NSColor) -> NSImage {
     if items.isEmpty {
         let size = NSSize(width: 24, height: 18)
         let image = NSImage(size: size, flipped: false) { _ in
@@ -1103,15 +1119,15 @@ private func statusImage(items: [UsageWindow?], color: NSColor) -> NSImage {
         .foregroundColor: NSColor.labelColor
     ]
 
-    let groups: [(window: UsageWindow?, eta: NSString, width: CGFloat)] = items.map { window in
+    let groups: [(window: UsageWindow?, weeklyIsExhausted: Bool, eta: NSString, width: CGFloat)] = items.map { item in
         let eta: NSString
-        if let window {
+        if let window = item.hourly {
             eta = statusETA(window.resetAt.timeIntervalSinceNow) as NSString
         } else {
             eta = "—"
         }
         let etaWidth = ceil(eta.size(withAttributes: etaAttributes).width)
-        return (window, eta, barWidth + barToETA + etaWidth)
+        return (item.hourly, item.weeklyIsExhausted, eta, barWidth + barToETA + etaWidth)
     }
 
     let width = groups.reduce(CGFloat(0)) { $0 + $1.width }
@@ -1123,13 +1139,14 @@ private func statusImage(items: [UsageWindow?], color: NSColor) -> NSImage {
 
         for group in groups {
             let bar = NSRect(x: x, y: 6, width: barWidth, height: barHeight)
-            NSColor.labelColor.withAlphaComponent(0.14).setFill()
+            let barOpacity: CGFloat = group.weeklyIsExhausted ? 0.22 : 1
+            NSColor.labelColor.withAlphaComponent(0.14 * barOpacity).setFill()
             NSBezierPath(roundedRect: bar, xRadius: 2, yRadius: 2).fill()
 
             if let window = group.window {
                 let fillWidth = floor(bar.width * CGFloat(window.remaining))
                 if fillWidth > 0 {
-                    color.setFill()
+                    color.withAlphaComponent(barOpacity).setFill()
                     NSBezierPath(
                         roundedRect: NSRect(x: bar.minX, y: bar.minY, width: fillWidth, height: bar.height),
                         xRadius: 2,
