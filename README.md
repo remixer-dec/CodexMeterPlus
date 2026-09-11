@@ -1,8 +1,8 @@
 # CodexMeterPlus
 
 A tiny macOS menu bar app for checking Codex usage across multiple accounts. Minimalistic and free from bloat by design.
-  
-<img width="364" height="411" alt="изображение" src="https://github.com/user-attachments/assets/3815af8b-3a24-4eca-9334-d4c3f9edf71b" />
+
+<img width="357" height="405" alt="изображение" src="https://github.com/user-attachments/assets/e92733dc-afce-479b-83a7-fbab8f2cf0a6" />
 
 
 It shows the remaining quota for each account, reset times, and a compact menu bar view with the daily usage bar and reset ETA. 
