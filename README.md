@@ -5,8 +5,8 @@ A tiny macOS menu bar app for checking Codex usage across multiple accounts. Min
 <img width="357" height="405" alt="изображение" src="https://github.com/user-attachments/assets/e92733dc-afce-479b-83a7-fbab8f2cf0a6" />
 
 
-It shows the remaining quota for each account, reset times, and a compact menu bar view with the daily usage bar and reset ETA. 
-Weekly usage stays inside the popover to keep the menu bar clean. Updates every minute when open and every 5 minutes when closed.
+It shows the remaining quota for each account, reset times, and a compact menu bar view with the 5-hour usage bar and reset ETA.
+Weekly usage stays inside the popover to keep the menu bar clean; when that quota is exhausted, the menu bar ETA switches to the number of days until its reset. Updates every minute when open and every 5 minutes when closed.
 
 ## Features
 
