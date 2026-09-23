@@ -1085,6 +1085,10 @@ private func statusETA(_ seconds: TimeInterval) -> String {
     return "\(max(0, Int(ceil(seconds / 60))))m"
 }
 
+private func statusDaysETA(_ seconds: TimeInterval) -> String {
+    return String(format: "%.1fd", max(0, seconds) / (24 * 60 * 60))
+}
+
 private struct MiniBarUsage {
     let hourly: UsageWindow?
     let weekly: UsageWindow?
@@ -1121,7 +1125,9 @@ private func statusImage(items: [MiniBarUsage], color: NSColor) -> NSImage {
 
     let groups: [(window: UsageWindow?, weeklyIsExhausted: Bool, eta: NSString, width: CGFloat)] = items.map { item in
         let eta: NSString
-        if let window = item.hourly {
+        if item.weeklyIsExhausted, let weekly = item.weekly {
+            eta = statusDaysETA(weekly.resetAt.timeIntervalSinceNow) as NSString
+        } else if let window = item.hourly {
             eta = statusETA(window.resetAt.timeIntervalSinceNow) as NSString
         } else {
             eta = "—"
