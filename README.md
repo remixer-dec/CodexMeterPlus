@@ -137,8 +137,11 @@ Anthropic may rotate the refresh token whenever either app refreshes it, which c
 
 ```bash
 CLAUDE_CONFIG_DIR="$HOME/.claude-usagemeter" claude   # then run /login and quit
+# mac os
 security dump-keychain | grep -o '"Claude Code-credentials-[0-9a-f]*"'   # find the service name
 security find-generic-password -s "Claude Code-credentials-XXXXXXXX" -w > ~/claude-credentials.json
+# linux
+cat ~/.claude/.credentials.json > claude.json
 ```
 
 Import the exported file, then delete it; the app keeps its own copy.
