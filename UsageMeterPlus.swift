@@ -2,17 +2,18 @@ import Cocoa
 import Foundation
 import UniformTypeIdentifiers
 
-// CodexMeterPlus.swift
-// Dependency-free macOS menu-bar Codex quota meter.
-// Build: xcrun swiftc -O -framework Cocoa CodexMeterPlus.swift -o CodexMeterPlus
+// UsageMeterPlus.swift
+// Dependency-free macOS menu-bar Codex + Claude quota meter.
+// Build: xcrun swiftc -O -framework Cocoa UsageMeterPlus.swift -o UsageMeterPlus
 //
 // Auth copies:
-//   ~/Library/Application Support/CodexMeterPlus/accounts/
+//   ~/Library/Application Support/UsageMeterPlus/accounts/
 // Settings:
-//   ~/Library/Application Support/CodexMeterPlus/settings.json
+//   ~/Library/Application Support/UsageMeterPlus/settings.json
 //
-// Network destinations are limited to OpenAI's OAuth refresh endpoint and
-// ChatGPT's Codex usage endpoint.
+// Network destinations are limited to OpenAI's OAuth refresh endpoint,
+// ChatGPT's Codex usage endpoint, Anthropic's OAuth refresh endpoint and
+// Anthropic's Claude usage endpoint.
 
 private let usageURL = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
 private let refreshURL = URL(string: "https://auth.openai.com/oauth/token")!
@@ -20,6 +21,13 @@ private let refreshURL = URL(string: "https://auth.openai.com/oauth/token")!
 // the official Codex login flow. Codex itself exposes a CLIENT_ID/oauth_client_id() in its open-source login module,
 // and the same client ID is visible in the browser authorization URL during normal Codex sign-in.
 private let codexOAuthClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
+private let claudeUsageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
+private let claudeRefreshURL = URL(string: "https://platform.claude.com/v1/oauth/token")!
+// Like the Codex one, claudeOAuthClientID is the public OAuth client identifier of the official Claude Code login
+// flow (visible in the claude.ai authorization URL during normal Claude Code sign-in). It is not a secret.
+private let claudeOAuthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+private let claudeOAuthScopes = "user:profile user:inference user:sessions:claude_code user:mcp_servers"
+private let claudeOAuthBeta = "oauth-2025-04-20"
 private let fiveHours: TimeInterval = 5 * 60 * 60
 private let sevenDays: TimeInterval = 7 * 24 * 60 * 60
 
@@ -27,11 +35,11 @@ private let sevenDays: TimeInterval = 7 * 24 * 60 * 60
 
 private struct UsageWindow {
     let remaining: Double       // 0...1, intentionally NOT percent used
-    let resetAt: Date
+    let resetAt: Date?          // nil when the window has not started yet (Claude reports no reset then)
     let duration: TimeInterval
 
     var resetRemaining: Double {
-        guard duration > 0 else { return 0 }
+        guard duration > 0, let resetAt else { return 0 }
         return min(1, max(0, resetAt.timeIntervalSinceNow / duration))
     }
 }
@@ -43,8 +51,28 @@ private struct UsageSnapshot {
     let fetchedAt: Date
 }
 
+private enum Provider: Equatable {
+    case codex
+    case claude
+
+    var displayName: String {
+        switch self {
+        case .codex: return "Codex"
+        case .claude: return "Claude"
+        }
+    }
+
+    var filePrefix: String {
+        switch self {
+        case .codex: return "codex"
+        case .claude: return "claude"
+        }
+    }
+}
+
 private struct Account: Equatable {
     let file: URL
+    let provider: Provider
 }
 
 private enum MeterError: LocalizedError {
@@ -69,8 +97,14 @@ private final class SettingsStore {
 
     init() {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        baseDirectory = support.appendingPathComponent("CodexMeterPlus", isDirectory: true)
+        baseDirectory = support.appendingPathComponent("UsageMeterPlus", isDirectory: true)
         file = baseDirectory.appendingPathComponent("settings.json")
+        // Carry accounts and settings over from the CodexMeterPlus era.
+        let legacy = support.appendingPathComponent("CodexMeterPlus", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: baseDirectory.path),
+           FileManager.default.fileExists(atPath: legacy.path) {
+            try? FileManager.default.moveItem(at: legacy, to: baseDirectory)
+        }
         try? FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
         try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: baseDirectory.path)
         load()
@@ -126,38 +160,47 @@ private final class AccountStore {
 
         let valid = urls
             .filter { $0.pathExtension.lowercased() == "json" }
-            .compactMap { url -> URL? in
-                guard let object = try? jsonObject(url), tokenDictionary(object) != nil else { return nil }
-                return url
+            .compactMap { url -> Account? in
+                guard let object = try? jsonObject(url), let provider = providerOf(object) else { return nil }
+                return Account(file: url, provider: provider)
             }
 
         var order = settings.data.accountOrder
-        let validNames = Set(valid.map(\.lastPathComponent))
+        let validNames = Set(valid.map(\.file.lastPathComponent))
         order.removeAll { !validNames.contains($0) }
-        for url in valid.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
-            if !order.contains(url.lastPathComponent) {
-                order.append(url.lastPathComponent)
+        for account in valid.sorted(by: { $0.file.lastPathComponent < $1.file.lastPathComponent }) {
+            if !order.contains(account.file.lastPathComponent) {
+                order.append(account.file.lastPathComponent)
             }
         }
         settings.setAccountOrder(order)
 
-        let byName = Dictionary(uniqueKeysWithValues: valid.map { ($0.lastPathComponent, $0) })
-        accounts = order.compactMap { byName[$0] }.map(Account.init(file:))
+        let byName = Dictionary(uniqueKeysWithValues: valid.map { ($0.file.lastPathComponent, $0) })
+        accounts = order.compactMap { byName[$0] }
     }
 
     @discardableResult
     func importAuth(from source: URL) throws -> Account {
         let object = try jsonObject(source)
-        guard let tokens = tokenDictionary(object),
-              tokens["access_token"] as? String != nil,
-              tokens["refresh_token"] as? String != nil else {
-            throw MeterError.message("That file is not a Codex ChatGPT OAuth auth.json.")
+        let provider: Provider
+        if let tokens = tokenDictionary(object),
+           tokens["access_token"] as? String != nil,
+           tokens["refresh_token"] as? String != nil {
+            provider = .codex
+        } else if let oauth = claudeOAuthDictionary(object),
+                  oauth["accessToken"] as? String != nil,
+                  oauth["refreshToken"] as? String != nil {
+            provider = .claude
+        } else {
+            throw MeterError.message(
+                "That file is neither a Codex ChatGPT OAuth auth.json nor a Claude Code OAuth credentials JSON."
+            )
         }
 
         var number = 1
         var destination: URL
         repeat {
-            destination = directory.appendingPathComponent("account-\(number).json")
+            destination = directory.appendingPathComponent("\(provider.filePrefix)-\(number).json")
             number += 1
         } while FileManager.default.fileExists(atPath: destination.path)
 
@@ -187,7 +230,7 @@ private final class AccountStore {
 
 // MARK: - API
 
-private final class CodexClient {
+private final class UsageClient {
     private let session: URLSession
 
     init() {
@@ -200,6 +243,13 @@ private final class CodexClient {
     }
 
     func fetch(account: Account, completion: @escaping (Result<UsageSnapshot, Error>) -> Void) {
+        switch account.provider {
+        case .codex: fetchCodex(account: account, completion: completion)
+        case .claude: fetchClaude(account: account, completion: completion)
+        }
+    }
+
+    private func fetchCodex(account: Account, completion: @escaping (Result<UsageSnapshot, Error>) -> Void) {
         DispatchQueue.global(qos: .utility).async {
             do {
                 let object = try jsonObject(account.file)
@@ -252,7 +302,7 @@ private final class CodexClient {
         var request = URLRequest(url: refreshURL)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.setValue("CodexMeterPlus/2", forHTTPHeaderField: "User-Agent")
+        request.setValue("UsageMeterPlus/3", forHTTPHeaderField: "User-Agent")
 
         let claims = jwtPayload(access)
         let clientID = (claims?["client_id"] as? String)
@@ -352,6 +402,177 @@ private final class CodexClient {
             }
         }.resume()
     }
+
+    private func fetchClaude(account: Account, completion: @escaping (Result<UsageSnapshot, Error>) -> Void) {
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                let object = try jsonObject(account.file)
+                let plan = claudeOAuthDictionary(object)?["subscriptionType"] as? String
+
+                self.validClaudeAccessToken(authObject: object, file: account.file) { result in
+                    switch result {
+                    case .failure(let error):
+                        completion(.failure(error))
+                    case .success(let token):
+                        self.fetchClaudeUsage(token: token, plan: plan, completion: completion)
+                    }
+                }
+            } catch {
+                completion(.failure(error))
+            }
+        }
+    }
+
+    private func validClaudeAccessToken(
+        authObject: [String: Any],
+        file: URL,
+        completion: @escaping (Result<String, Error>) -> Void
+    ) {
+        guard let oauth = claudeOAuthDictionary(authObject),
+              let access = oauth["accessToken"] as? String, !access.isEmpty else {
+            completion(.failure(MeterError.message("Missing Claude access token.")))
+            return
+        }
+
+        // expiresAt is epoch milliseconds. Refresh five minutes early; tokens
+        // without an expiry (long-lived setup tokens) are used as-is.
+        guard let expiresAt = number(oauth["expiresAt"]) else {
+            completion(.success(access))
+            return
+        }
+        if Date(timeIntervalSince1970: expiresAt / 1000).timeIntervalSinceNow > 5 * 60 {
+            completion(.success(access))
+            return
+        }
+
+        guard let refresh = oauth["refreshToken"] as? String, !refresh.isEmpty else {
+            completion(.failure(MeterError.message("Access token expired and no refresh token is present.")))
+            return
+        }
+
+        var request = URLRequest(url: claudeRefreshURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("UsageMeterPlus/3", forHTTPHeaderField: "User-Agent")
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: [
+                "grant_type": "refresh_token",
+                "refresh_token": refresh,
+                "client_id": claudeOAuthClientID,
+                "scope": claudeOAuthScopes
+            ])
+        } catch {
+            completion(.failure(error))
+            return
+        }
+
+        session.dataTask(with: request) { data, response, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+            guard let http = response as? HTTPURLResponse, let data else {
+                completion(.failure(MeterError.message("No response from Claude OAuth token endpoint.")))
+                return
+            }
+            guard (200..<300).contains(http.statusCode) else {
+                completion(.failure(MeterError.message(
+                    "OAuth refresh failed (HTTP \(http.statusCode)). Re-import/re-login this account."
+                )))
+                return
+            }
+
+            do {
+                guard let refreshed = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let newAccess = refreshed["access_token"] as? String else {
+                    throw MeterError.message("OAuth refresh response had no access_token.")
+                }
+
+                var updated = authObject
+                var newOAuth = oauth
+                newOAuth["accessToken"] = newAccess
+                if let newRefresh = refreshed["refresh_token"] as? String, !newRefresh.isEmpty {
+                    newOAuth["refreshToken"] = newRefresh
+                }
+                if let expiresIn = number(refreshed["expires_in"]) {
+                    newOAuth["expiresAt"] = Int64((Date().timeIntervalSince1970 + expiresIn) * 1000)
+                }
+                if let scope = refreshed["scope"] as? String, !scope.isEmpty {
+                    newOAuth["scopes"] = scope.split(separator: " ").map(String.init)
+                }
+                updated["claudeAiOauth"] = newOAuth
+
+                let output = try JSONSerialization.data(
+                    withJSONObject: updated,
+                    options: [.prettyPrinted, .sortedKeys]
+                )
+                try output.write(to: file, options: .atomic)
+                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+                completion(.success(newAccess))
+            } catch {
+                completion(.failure(error))
+            }
+        }.resume()
+    }
+
+    private func fetchClaudeUsage(
+        token: String,
+        plan: String?,
+        completion: @escaping (Result<UsageSnapshot, Error>) -> Void
+    ) {
+        var request = URLRequest(url: claudeUsageURL)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue(claudeOAuthBeta, forHTTPHeaderField: "anthropic-beta")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("claude-code/2.1.0", forHTTPHeaderField: "User-Agent")
+
+        session.dataTask(with: request) { data, response, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+            guard let http = response as? HTTPURLResponse, let data else {
+                completion(.failure(MeterError.message("No response from Claude usage endpoint.")))
+                return
+            }
+            guard (200..<300).contains(http.statusCode) else {
+                completion(.failure(MeterError.message("Usage request failed (HTTP \(http.statusCode)).")))
+                return
+            }
+
+            do {
+                guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    throw MeterError.message("Unexpected usage response.")
+                }
+                completion(.success(parseClaudeUsage(root, plan: plan)))
+            } catch {
+                completion(.failure(error))
+            }
+        }.resume()
+    }
+}
+
+private func parseClaudeUsage(_ root: [String: Any], plan: String?) -> UsageSnapshot {
+    UsageSnapshot(
+        fiveHour: parseClaudeWindow(root["five_hour"], duration: fiveHours),
+        weekly: parseClaudeWindow(root["seven_day"], duration: sevenDays),
+        plan: plan,
+        fetchedAt: Date()
+    )
+}
+
+private func parseClaudeWindow(_ value: Any?, duration: TimeInterval) -> UsageWindow? {
+    // Claude reports utilization as percentage CONSUMED (0...100), and
+    // resets_at as ISO 8601 (null until the window has started).
+    guard let raw = value as? [String: Any] else { return nil }
+    let used = number(raw["utilization"]) ?? 0
+    return UsageWindow(
+        remaining: min(1, max(0, 1 - used / 100)),
+        resetAt: (raw["resets_at"] as? String).flatMap(parseISODate),
+        duration: duration
+    )
 }
 
 private func parseUsage(_ root: [String: Any]) -> UsageSnapshot {
@@ -536,7 +757,7 @@ private final class WindowRow: NSView {
         }
 
         value.stringValue = "\(Int((window.remaining * 100).rounded()))% remaining"
-        reset.stringValue = resetDescription(window.resetAt)
+        reset.stringValue = window.resetAt.map(resetDescription) ?? "window not started"
         bar.fraction = window.remaining
     }
 }
@@ -628,7 +849,7 @@ private final class AccountCard: NSView {
         if email == nil { showingEmail = false }
         refreshAccountTitle()
 
-        plan.stringValue = planDescription(snapshot?.plan)
+        plan.stringValue = planDescription(account.provider, snapshot?.plan)
         fiveRow.update(snapshot?.fiveHour, color: color)
         weekRow.update(snapshot?.weekly, color: color)
         error.stringValue = message ?? ""
@@ -640,7 +861,7 @@ private final class AccountCard: NSView {
             accountTitle.toolTip = "Click to hide email"
         } else {
             accountTitle.title = "Account \(accountIndex)"
-            accountTitle.toolTip = email == nil ? "Email unavailable in imported token" : "Click to show email"
+            accountTitle.toolTip = email == nil ? "Email unavailable in imported credentials" : "Click to show email"
         }
     }
 
@@ -845,7 +1066,7 @@ private final class PanelController: NSViewController {
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let settings = SettingsStore()
     private lazy var store = AccountStore(settings: settings)
-    private let client = CodexClient()
+    private let client = UsageClient()
     private let panel = PanelController()
     private let popover = NSPopover()
     private var statusItem: NSStatusItem!
@@ -862,7 +1083,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
         statusItem.button?.action = #selector(togglePopover)
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         statusItem.button?.imagePosition = .imageOnly
-        statusItem.button?.toolTip = "Codex usage"
+        statusItem.button?.toolTip = "Codex + Claude usage"
 
         popover.behavior = .transient
         popover.animates = false
@@ -985,8 +1206,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
 
     private func addAccounts() {
         let open = NSOpenPanel()
-        open.title = "Import Codex auth.json"
-        open.message = "Select one or more Codex OAuth auth.json files."
+        open.title = "Import Codex or Claude credentials"
+        open.message = "Select one or more Codex auth.json or Claude Code credentials JSON files."
         open.allowedContentTypes = [.json]
         open.allowsMultipleSelection = true
         open.canChooseDirectories = false
@@ -1015,7 +1236,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
 
         let alert = NSAlert()
         alert.messageText = "Remove Account \(index + 1)?"
-        alert.informativeText = "Only CodexMeterPlus's imported credential copy is deleted."
+        alert.informativeText = "Only UsageMeterPlus's imported credential copy is deleted."
         alert.addButton(withTitle: "Remove")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
@@ -1040,22 +1261,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
         let image = statusImage(items: items, color: paletteColor(settings.data.barColor))
         statusItem.button?.image = image
         statusItem.button?.toolTip = store.accounts.isEmpty
-            ? "Codex usage — click to add an account"
-            : "Codex usage — \(store.accounts.count) account\(store.accounts.count == 1 ? "" : "s")"
+            ? "Codex + Claude usage — click to add an account"
+            : "Codex + Claude usage — \(store.accounts.count) account\(store.accounts.count == 1 ? "" : "s")"
     }
 }
 
 // MARK: - Formatting + icon
 
-private func planDescription(_ raw: String?) -> String {
-    guard let raw, !raw.isEmpty else { return "Codex" }
+private func planDescription(_ provider: Provider, _ raw: String?) -> String {
+    let name = provider.displayName
+    guard let raw, !raw.isEmpty else { return name }
     let words = raw
         .replacingOccurrences(of: "_", with: " ")
         .replacingOccurrences(of: "-", with: " ")
         .split(separator: " ")
         .map { String($0).capitalized }
         .joined(separator: " ")
-    return "Codex \(words)"
+    return "\(name) \(words)"
 }
 
 private func resetDescription(_ date: Date) -> String {
@@ -1107,7 +1329,7 @@ private func statusImage(items: [MiniBarUsage], color: NSColor) -> NSImage {
                 .font: NSFont.systemFont(ofSize: 11, weight: .medium),
                 .foregroundColor: NSColor.labelColor
             ]
-            ("C+" as NSString).draw(at: NSPoint(x: 3, y: 3), withAttributes: attributes)
+            ("U+" as NSString).draw(at: NSPoint(x: 3, y: 3), withAttributes: attributes)
             return true
         }
         image.isTemplate = false
@@ -1125,10 +1347,10 @@ private func statusImage(items: [MiniBarUsage], color: NSColor) -> NSImage {
 
     let groups: [(window: UsageWindow?, weeklyIsExhausted: Bool, eta: NSString, width: CGFloat)] = items.map { item in
         let eta: NSString
-        if item.weeklyIsExhausted, let weekly = item.weekly {
-            eta = statusDaysETA(weekly.resetAt.timeIntervalSinceNow) as NSString
-        } else if let window = item.hourly {
-            eta = statusETA(window.resetAt.timeIntervalSinceNow) as NSString
+        if item.weeklyIsExhausted, let reset = item.weekly?.resetAt {
+            eta = statusDaysETA(reset.timeIntervalSinceNow) as NSString
+        } else if let reset = item.hourly?.resetAt {
+            eta = statusETA(reset.timeIntervalSinceNow) as NSString
         } else {
             eta = "—"
         }
@@ -1193,11 +1415,32 @@ private func tokenDictionary(_ root: [String: Any]) -> [String: Any]? {
     root["tokens"] as? [String: Any]
 }
 
-private func accountEmail(_ account: Account) -> String? {
-    guard let root = try? jsonObject(account.file),
-          let tokens = tokenDictionary(root) else { return nil }
+private func claudeOAuthDictionary(_ root: [String: Any]) -> [String: Any]? {
+    root["claudeAiOauth"] as? [String: Any]
+}
 
+private func providerOf(_ root: [String: Any]) -> Provider? {
+    if tokenDictionary(root) != nil { return .codex }
+    if claudeOAuthDictionary(root) != nil { return .claude }
+    return nil
+}
+
+private func parseISODate(_ text: String) -> Date? {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = formatter.date(from: text) { return date }
+    // Fall back to dropping sub-second precision (Claude sends microseconds).
+    formatter.formatOptions = [.withInternetDateTime]
+    let trimmed = text.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
+    return formatter.date(from: trimmed)
+}
+
+private func accountEmail(_ account: Account) -> String? {
+    guard let root = try? jsonObject(account.file) else { return nil }
     if let email = root["email"] as? String, !email.isEmpty { return email }
+    if let email = claudeOAuthDictionary(root)?["email"] as? String, !email.isEmpty { return email }
+
+    guard let tokens = tokenDictionary(root) else { return nil }
     if let email = tokens["email"] as? String, !email.isEmpty { return email }
 
     for key in ["id_token", "access_token"] {
